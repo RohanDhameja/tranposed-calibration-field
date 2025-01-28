@@ -10,6 +10,10 @@ import org.opencv.imgproc.*;
 import org.opencv.videoio.*;
 import org.opencv.highgui.*;
 import org.opencv.utils.*;
+import org.apache.commons.math3.optim.*;
+import org.apache.commons.math3.fitting.leastsquares.*;
+import org.apache.commons.math3.linear.*;
+import org.apache.commons.math3.util.Pair;
 
 public class Main {
     public static void main(String[] args) {
@@ -34,6 +38,7 @@ public class Main {
             }
         }
 
+        // Distortion coefficients
         SimpleMatrix cameraDistortion = new SimpleMatrix(8, 1);
         JSONArray cameraDistortionArray = jsonData.getJSONArray("distortion_coefficients");
         for (int i = 0; i < cameraDistortion.numRows(); i++) {
@@ -171,5 +176,99 @@ public class Main {
         cameraToTag.set(3, 3, 1.0);
 
         return cameraToTag;
+    }
+
+    public static void optimizePoses(List<Pose> poses, List<Constraint> constraints) {
+        MultivariateJacobianFunction objectiveFunction = new MultivariateJacobianFunction() {
+            @Override
+            public Pair<RealVector, RealMatrix> value(RealVector point) {
+                int numPoses = poses.size();
+                int numConstraints = constraints.size();
+                double[] residuals = new double[numConstraints * 6];
+                double[][] jacobian = new double[numConstraints * 6][numPoses * 7];
+
+                for (int i = 0; i < numPoses; i++) {
+                    double[] poseData = point.toArray();
+                    poses.get(i).p.set(0, poseData[i * 7]);
+                    poses.get(i).p.set(1, poseData[i * 7 + 1]);
+                    poses.get(i).p.set(2, poseData[i * 7 + 2]);
+                    poses.get(i).q.set(0, poseData[i * 7 + 3]);
+                    poses.get(i).q.set(1, poseData[i * 7 + 4]);
+                    poses.get(i).q.set(2, poseData[i * 7 + 5]);
+                    poses.get(i).q.set(3, poseData[i * 7 + 6]);
+                }
+
+                for (int k = 0; k < numConstraints; k++) {
+                    Constraint constraint = constraints.get(k);
+                    Pose poseBegin = poses.get(constraint.id_begin);
+                    Pose poseEnd = poses.get(constraint.id_end);
+
+                    // Compute residuals but its just a simple example
+                    SimpleMatrix residual = poseBegin.p.minus(poseEnd.p);
+                    System.arraycopy(residual.getDDRM().getData(), 0, residuals, k * 6, 3);
+
+                    // Compute jacobian but its just a sipmle example
+                    for (int j = 0; j < 3; j++) {
+                        jacobian[k * 6 + j][constraint.id_begin * 7 + j] = 1.0;
+                        jacobian[k * 6 + j][constraint.id_end * 7 + j] = -1.0;
+                    }
+                }
+
+                RealVector residualsVector = new ArrayRealVector(residuals);
+                RealMatrix jacobianMatrix = new Array2DRowRealMatrix(jacobian);
+
+                return new Pair<>(residualsVector, jacobianMatrix);
+            }
+        };
+
+        double[] initialGuess = new double[poses.size() * 7];
+        for (int i = 0; i < poses.size(); i++) {
+            System.arraycopy(poses.get(i).p.getDDRM().getData(), 0, initialGuess, i * 7, 3);
+            System.arraycopy(poses.get(i).q.getDDRM().getData(), 0, initialGuess, i * 7 + 3, 4);
+        }
+
+        LeastSquaresOptimizer optimizer = new LevenbergMarquardtOptimizer();
+
+        LeastSquaresProblem problem = new LeastSquaresBuilder()
+            .start(initialGuess)
+            .model(objectiveFunction)
+            .target(new double[constraints.size() * 6]) // 6 residuals per constraint
+            .lazyEvaluation(false)
+            .maxEvaluations(1000)
+            .maxIterations(1000)
+            .build();
+
+        LeastSquaresOptimizer.Optimum optimum = optimizer.optimize(problem);
+
+        double[] optimizedValues = optimum.getPoint().toArray();
+        for (int i = 0; i < poses.size(); i++) {
+            poses.get(i).p.set(0, optimizedValues[i * 7]);
+            poses.get(i).p.set(1, optimizedValues[i * 7 + 1]);
+            poses.get(i).p.set(2, optimizedValues[i * 7 + 2]);
+            poses.get(i).q.set(0, optimizedValues[i * 7 + 3]);
+            poses.get(i).q.set(1, optimizedValues[i * 7 + 4]);
+            poses.get(i).q.set(2, optimizedValues[i * 7 + 5]);
+            poses.get(i).q.set(3, optimizedValues[i * 7 + 6]);
+        }
+    }
+
+    public static class Pose {
+        public SimpleMatrix p;
+        public SimpleMatrix q;
+
+        public Pose(SimpleMatrix p, SimpleMatrix q) {
+            this.p = p;
+            this.q = q;
+        }
+    }
+
+    public static class Constraint {
+        public int id_begin;
+        public int id_end;
+
+        public Constraint(int id_begin, int id_end) {
+            this.id_begin = id_begin;
+            this.id_end = id_end;
+        }
     }
 }
