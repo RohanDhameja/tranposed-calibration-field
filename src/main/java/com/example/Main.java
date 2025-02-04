@@ -8,267 +8,225 @@ import org.opencv.core.*;
 import org.opencv.calib3d.*;
 import org.opencv.imgproc.*;
 import org.opencv.videoio.*;
-import org.opencv.highgui.*;
-import org.opencv.utils.*;
+import edu.wpi.first.apriltag.*;
 import org.apache.commons.math3.optim.*;
 import org.apache.commons.math3.fitting.leastsquares.*;
 import org.apache.commons.math3.linear.*;
 import org.apache.commons.math3.util.Pair;
 
 public class Main {
-    public static void main(String[] args) {
-        System.out.println("Hello, world!");
+    static {
+        System.loadLibrary(Core.NATIVE_LIBRARY_NAME);
     }
 
-    public static Tuple<SimpleMatrix, SimpleMatrix> loadCameraModel(String path) throws IOException {
-        BufferedReader reader = new BufferedReader(new FileReader(path));
-        StringBuilder jsonBuilder = new StringBuilder();
-        String line;
-        while ((line = reader.readLine()) != null) {
-            jsonBuilder.append(line);
-        }
-        reader.close();
-        JSONObject jsonData = new JSONObject(jsonBuilder.toString());
+    private static final String FRC_2025_FIELD_MAP_JSON = "{ \"tags\": ["
+        + "{ \"ID\": 1, \"pose\": { \"translation\": { \"x\": 1.0, \"y\": 2.0, \"z\": 3.0 }, \"rotation\": { \"quaternion\": { \"W\": 1.0, \"X\": 0.0, \"Y\": 0.0, \"Z\": 0.0 } } } },"
+        + "{ \"ID\": 2, \"pose\": { \"translation\": { \"x\": 4.0, \"y\": 5.0, \"z\": 6.0 }, \"rotation\": { \"quaternion\": { \"W\": 1.0, \"X\": 0.0, \"Y\": 0.0, \"Z\": 0.0 } } } },"
+        + "{ \"ID\": 3, \"pose\": { \"translation\": { \"x\": 7.0, \"y\": 8.0, \"z\": 9.0 }, \"rotation\": { \"quaternion\": { \"W\": 1.0, \"X\": 0.0, \"Y\": 0.0, \"Z\": 0.0 } } } },"
+        + "{ \"ID\": 4, \"pose\": { \"translation\": { \"x\": 10.0, \"y\": 11.0, \"z\": 12.0 }, \"rotation\": { \"quaternion\": { \"W\": 1.0, \"X\": 0.0, \"Y\": 0.0, \"Z\": 0.0 } } } }"
+        + "] }";
 
-        SimpleMatrix cameraMatrix = new SimpleMatrix(3, 3);
-        JSONArray cameraMatrixArray = jsonData.getJSONArray("camera_matrix");
-        for (int i = 0; i < cameraMatrix.numRows(); i++) {
-            for (int j = 0; j < cameraMatrix.numCols(); j++) {
-                cameraMatrix.set(i, j, cameraMatrixArray.getDouble(i * cameraMatrix.numCols() + j));
+    private static Mat cameraMatrix;
+    private static Mat distCoeffs;
+
+    public static void main(String[] args) {
+        if (args.length < 2) {
+            System.out.println("Usage: java Main <calibration_video> <video_file>");
+            return;
+        }
+
+        String calibrationVideoPath = args[0];
+        String videoFilePath = args[1];
+
+        try {
+            calibrateCamera(calibrationVideoPath);
+            Map<Integer, SimpleMatrix> idealTransforms = loadIdealMap();
+            processVideo(videoFilePath, idealTransforms);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public static void calibrateCamera(String videoFilePath) {
+        List<Mat> imagePoints = new ArrayList<>();
+        List<Mat> objectPoints = new ArrayList<>();
+        MatOfPoint3f obj = new MatOfPoint3f();
+        int boardWidth = 9;
+        int boardHeight = 6;
+        Size boardSize = new Size(boardWidth, boardHeight);
+
+        for (int i = 0; i < boardHeight; i++) {
+            for (int j = 0; j < boardWidth; j++) {
+                obj.push_back(new MatOfPoint3f(new Point3(j, i, 0.0f)));
             }
         }
 
-        // Distortion coefficients
-        SimpleMatrix cameraDistortion = new SimpleMatrix(8, 1);
-        JSONArray cameraDistortionArray = jsonData.getJSONArray("distortion_coefficients");
-        for (int i = 0; i < cameraDistortion.numRows(); i++) {
-            cameraDistortion.set(i, cameraDistortionArray.getDouble(i));
+        VideoCapture capture = new VideoCapture(videoFilePath);
+        if (!capture.isOpened()) {
+            System.out.println("Error opening calibration video file");
+            return;
         }
 
-        return new Tuple<>(cameraMatrix, cameraDistortion);
+        Mat frame = new Mat();
+        while (capture.read(frame)) {
+            Mat gray = new Mat();
+            Imgproc.cvtColor(frame, gray, Imgproc.COLOR_BGR2GRAY);
+            MatOfPoint2f imageCorners = new MatOfPoint2f();
+            boolean found = Calib3d.findChessboardCorners(gray, boardSize, imageCorners);
+
+            if (found) {
+                imagePoints.add(imageCorners);
+                objectPoints.add(obj);
+            }
+        }
+
+        capture.release();
+
+        cameraMatrix = Mat.eye(3, 3, CvType.CV_64F);
+        distCoeffs = Mat.zeros(5, 1, CvType.CV_64F);
+        List<Mat> rvecs = new ArrayList<>();
+        List<Mat> tvecs = new ArrayList<>();
+
+        Calib3d.calibrateCamera(objectPoints, imagePoints, frame.size(), cameraMatrix, distCoeffs, rvecs, tvecs);
     }
 
-    public static Map<Integer, JSONObject> loadIdealMap(String path) throws IOException {
-        BufferedReader reader = new BufferedReader(new FileReader(path));
-        StringBuilder jsonBuilder = new StringBuilder();
-        String line;
-        while ((line = reader.readLine()) != null) {
-            jsonBuilder.append(line);
-        }
-        reader.close();
-        JSONObject jsonData = new JSONObject(jsonBuilder.toString());
+    public static Map<Integer, SimpleMatrix> loadIdealMap() throws IOException {
+        JSONObject jsonData = new JSONObject(FRC_2025_FIELD_MAP_JSON);
 
-        Map<Integer, JSONObject> idealMap = new HashMap<>();
+        Map<Integer, SimpleMatrix> idealTransforms = new HashMap<>();
         JSONArray tagsArray = jsonData.getJSONArray("tags");
         for (int i = 0; i < tagsArray.length(); i++) {
-            JSONObject element = tagsArray.getJSONObject(i);
-            int id = element.getInt("ID");
-            idealMap.put(id, element);
+            JSONObject tag = tagsArray.getJSONObject(i);
+            SimpleMatrix H_world_tag = SimpleMatrix.identity(4);
+
+            H_world_tag.set(0, 3, tag.getJSONObject("pose").getJSONObject("translation").getDouble("x"));
+            H_world_tag.set(1, 3, tag.getJSONObject("pose").getJSONObject("translation").getDouble("y"));
+            H_world_tag.set(2, 3, tag.getJSONObject("pose").getJSONObject("translation").getDouble("z"));
+
+            double[] quaternion = {
+                tag.getJSONObject("pose").getJSONObject("rotation").getJSONObject("quaternion").getDouble("W"),
+                tag.getJSONObject("pose").getJSONObject("rotation").getJSONObject("quaternion").getDouble("X"),
+                tag.getJSONObject("pose").getJSONObject("rotation").getJSONObject("quaternion").getDouble("Y"),
+                tag.getJSONObject("pose").getJSONObject("rotation").getJSONObject("quaternion").getDouble("Z")
+            };
+
+            SimpleMatrix rotationMatrix = quaternionToMatrix(quaternion);
+            H_world_tag.insertIntoThis(0, 0, rotationMatrix);
+
+            idealTransforms.put(tag.getInt("ID"), H_world_tag);
         }
 
-        return idealMap;
+        return idealTransforms;
     }
 
-    public static SimpleMatrix getTagTransform(Map<Integer, JSONObject> idealMap, int tagId) {
-        SimpleMatrix transform = SimpleMatrix.identity(4);
+    private static SimpleMatrix quaternionToMatrix(double[] q) {
+        double w = q[0];
+        double x = q[1];
+        double y = q[2];
+        double z = q[3];
 
-        JSONObject tag = idealMap.get(tagId);
-        JSONObject rotation = tag.getJSONObject("pose").getJSONObject("rotation").getJSONObject("quaternion");
-        JSONObject translation = tag.getJSONObject("pose").getJSONObject("translation");
-
-        double w = rotation.getDouble("W");
-        double x = rotation.getDouble("X");
-        double y = rotation.getDouble("Y");
-        double z = rotation.getDouble("Z");
-
-        SimpleMatrix rotationMatrix = new SimpleMatrix(3, 3);
-        rotationMatrix.set(0, 0, 1 - 2 * y * y - 2 * z * z);
-        rotationMatrix.set(0, 1, 2 * x * y - 2 * z * w);
-        rotationMatrix.set(0, 2, 2 * x * z + 2 * y * w);
-        rotationMatrix.set(1, 0, 2 * x * y + 2 * z * w);
-        rotationMatrix.set(1, 1, 1 - 2 * x * x - 2 * z * z);
-        rotationMatrix.set(1, 2, 2 * y * z - 2 * x * w);
-        rotationMatrix.set(2, 0, 2 * x * z - 2 * y * w);
-        rotationMatrix.set(2, 1, 2 * y * z + 2 * x * w);
-        rotationMatrix.set(2, 2, 1 - 2 * x * x - 2 * y * y);
-
-        transform.insertIntoThis(0, 0, rotationMatrix);
-        transform.set(0, 3, translation.getDouble("x"));
-        transform.set(1, 3, translation.getDouble("y"));
-        transform.set(2, 3, translation.getDouble("z"));
-
-        return transform;
-    }
-
-    public static SimpleMatrix estimateTagPose(
-        double[][] tagDetection,
-        SimpleMatrix cameraMatrix,
-        SimpleMatrix cameraDistortion,
-        double tagSize
-    ) {
-        Mat cameraMatrixCv = new Mat(3, 3, CvType.CV_64F);
-        Mat cameraDistortionCv = new Mat(8, 1, CvType.CV_64F);
-
-        for (int i = 0; i < cameraMatrix.numRows(); i++) {
-            for (int j = 0; j < cameraMatrix.numCols(); j++) {
-                cameraMatrixCv.put(i, j, cameraMatrix.get(i, j));
-            }
-        }
-
-        for (int i = 0; i < cameraDistortion.numRows(); i++) {
-            cameraDistortionCv.put(i, 0, cameraDistortion.get(i, 0));
-        }
-
-        List<Point> points2d = Arrays.asList(
-            new Point(tagDetection[0][0], tagDetection[0][1]),
-            new Point(tagDetection[1][0], tagDetection[1][1]),
-            new Point(tagDetection[2][0], tagDetection[2][1]),
-            new Point(tagDetection[3][0], tagDetection[3][1])
-        );
-
-        List<Point3> points3dBoxBase = Arrays.asList(
-            new Point3(-tagSize / 2.0,  tagSize / 2.0, 0.0),
-            new Point3( tagSize / 2.0,  tagSize / 2.0, 0.0),
-            new Point3( tagSize / 2.0, -tagSize / 2.0, 0.0),
-            new Point3(-tagSize / 2.0, -tagSize / 2.0, 0.0)
-        );
-
-        Mat rVec = new Mat();
-        Mat tVec = new Mat();
-
-        MatOfPoint3f objectPoints = new MatOfPoint3f();
-        objectPoints.fromList(points3dBoxBase);
-
-        MatOfPoint2f imagePoints = new MatOfPoint2f();
-        imagePoints.fromList(points2d);
-
-        MatOfDouble distCoeffs = new MatOfDouble();
-        cameraDistortionCv.convertTo(distCoeffs, CvType.CV_64F);
-
-        Calib3d.solvePnP(
-            objectPoints,
-            imagePoints,
-            cameraMatrixCv,
-            distCoeffs,
-            rVec,
-            tVec
-        );
-
-        Mat rMat = new Mat();
-        Calib3d.Rodrigues(rVec, rMat);
-
-        SimpleMatrix cameraToTag = new SimpleMatrix(4, 4);
-        cameraToTag.set(0, 0, rMat.get(0, 0)[0]);
-        cameraToTag.set(0, 1, rMat.get(0, 1)[0]);
-        cameraToTag.set(0, 2, rMat.get(0, 2)[0]);
-        cameraToTag.set(0, 3, tVec.get(0, 0)[0]);
-        cameraToTag.set(1, 0, rMat.get(1, 0)[0]);
-        cameraToTag.set(1, 1, rMat.get(1, 1)[0]);
-        cameraToTag.set(1, 2, rMat.get(1, 2)[0]);
-        cameraToTag.set(1, 3, tVec.get(1, 0)[0]);
-        cameraToTag.set(2, 0, rMat.get(2, 0)[0]);
-        cameraToTag.set(2, 1, rMat.get(2, 1)[0]);
-        cameraToTag.set(2, 2, rMat.get(2, 2)[0]);
-        cameraToTag.set(2, 3, tVec.get(2, 0)[0]);
-        cameraToTag.set(3, 0, 0.0);
-        cameraToTag.set(3, 1, 0.0);
-        cameraToTag.set(3, 2, 0.0);
-        cameraToTag.set(3, 3, 1.0);
-
-        return cameraToTag;
-    }
-
-    public static void optimizePoses(List<Pose> poses, List<Constraint> constraints) {
-        MultivariateJacobianFunction objectiveFunction = new MultivariateJacobianFunction() {
-            @Override
-            public Pair<RealVector, RealMatrix> value(RealVector point) {
-                int numPoses = poses.size();
-                int numConstraints = constraints.size();
-                double[] residuals = new double[numConstraints * 6];
-                double[][] jacobian = new double[numConstraints * 6][numPoses * 7];
-
-                for (int i = 0; i < numPoses; i++) {
-                    double[] poseData = point.toArray();
-                    poses.get(i).p.set(0, poseData[i * 7]);
-                    poses.get(i).p.set(1, poseData[i * 7 + 1]);
-                    poses.get(i).p.set(2, poseData[i * 7 + 2]);
-                    poses.get(i).q.set(0, poseData[i * 7 + 3]);
-                    poses.get(i).q.set(1, poseData[i * 7 + 4]);
-                    poses.get(i).q.set(2, poseData[i * 7 + 5]);
-                    poses.get(i).q.set(3, poseData[i * 7 + 6]);
-                }
-
-                for (int k = 0; k < numConstraints; k++) {
-                    Constraint constraint = constraints.get(k);
-                    Pose poseBegin = poses.get(constraint.id_begin);
-                    Pose poseEnd = poses.get(constraint.id_end);
-
-                    // Compute residuals but its just a simple example
-                    SimpleMatrix residual = poseBegin.p.minus(poseEnd.p);
-                    System.arraycopy(residual.getDDRM().getData(), 0, residuals, k * 6, 3);
-
-                    // Compute jacobian but its just a sipmle example
-                    for (int j = 0; j < 3; j++) {
-                        jacobian[k * 6 + j][constraint.id_begin * 7 + j] = 1.0;
-                        jacobian[k * 6 + j][constraint.id_end * 7 + j] = -1.0;
-                    }
-                }
-
-                RealVector residualsVector = new ArrayRealVector(residuals);
-                RealMatrix jacobianMatrix = new Array2DRowRealMatrix(jacobian);
-
-                return new Pair<>(residualsVector, jacobianMatrix);
-            }
+        double[][] data = {
+            {1 - 2 * y * y - 2 * z * z, 2 * x * y - 2 * z * w, 2 * x * z + 2 * y * w},
+            {2 * x * y + 2 * z * w, 1 - 2 * x * x - 2 * z * z, 2 * y * z - 2 * x * w},
+            {2 * x * z - 2 * y * w, 2 * y * z + 2 * x * w, 1 - 2 * x * x - 2 * y * y}
         };
 
-        double[] initialGuess = new double[poses.size() * 7];
-        for (int i = 0; i < poses.size(); i++) {
-            System.arraycopy(poses.get(i).p.getDDRM().getData(), 0, initialGuess, i * 7, 3);
-            System.arraycopy(poses.get(i).q.getDDRM().getData(), 0, initialGuess, i * 7 + 3, 4);
+        return new SimpleMatrix(data);
+    }
+
+    public static void processVideo(String videoFilePath, Map<Integer, SimpleMatrix> idealTransforms) {
+        // Load the video
+        VideoCapture capture = new VideoCapture(videoFilePath);
+        if (!capture.isOpened()) {
+            System.out.println("Error opening video file");
+            return;
         }
 
-        LeastSquaresOptimizer optimizer = new LevenbergMarquardtOptimizer();
+        Mat frame = new Mat();
+        while (capture.read(frame)) {
+            // Process each frame to detect AprilTags and extract their locations
+            List<DetectedTag> detectedTags = detectAprilTags(frame);
 
-        LeastSquaresProblem problem = new LeastSquaresBuilder()
-            .start(initialGuess)
-            .model(objectiveFunction)
-            .target(new double[constraints.size() * 6]) // 6 residuals per constraint
-            .lazyEvaluation(false)
-            .maxEvaluations(1000)
-            .maxIterations(1000)
-            .build();
+            // Use the reference tag to find the locations of the rest
+            if (!detectedTags.isEmpty()) {
+                DetectedTag referenceTag = detectedTags.get(0); // Assume the first detected tag is the reference tag
+                SimpleMatrix referenceTransform = referenceTag.transform;
 
-        LeastSquaresOptimizer.Optimum optimum = optimizer.optimize(problem);
+                for (DetectedTag detectedTag : detectedTags) {
+                    SimpleMatrix relativeTransform = referenceTransform.invert().mult(detectedTag.transform);
+                    detectedTag.transform = relativeTransform;
+                }
 
-        double[] optimizedValues = optimum.getPoint().toArray();
-        for (int i = 0; i < poses.size(); i++) {
-            poses.get(i).p.set(0, optimizedValues[i * 7]);
-            poses.get(i).p.set(1, optimizedValues[i * 7 + 1]);
-            poses.get(i).p.set(2, optimizedValues[i * 7 + 2]);
-            poses.get(i).q.set(0, optimizedValues[i * 7 + 3]);
-            poses.get(i).q.set(1, optimizedValues[i * 7 + 4]);
-            poses.get(i).q.set(2, optimizedValues[i * 7 + 5]);
-            poses.get(i).q.set(3, optimizedValues[i * 7 + 6]);
+                // Compare detected tags with ideal map
+                compareWithIdealMap(detectedTags, idealTransforms);
+            }
+
+            // Display the frame (optional)
+            // HighGui.imshow("Frame", frame);
+            // if (HighGui.waitKey(30) >= 0) break;
+        }
+
+        capture.release();
+        // HighGui.destroyAllWindows();
+    }
+
+    public static List<DetectedTag> detectAprilTags(Mat frame) {
+        List<DetectedTag> detectedTags = new ArrayList<>();
+
+        // Convert the frame to grayscale
+        Mat gray = new Mat();
+        Imgproc.cvtColor(frame, gray, Imgproc.COLOR_BGR2GRAY);
+
+        // Initialize the AprilTag detector
+        AprilTagDetector detector = new AprilTagDetector();
+        detector.addFamily("tag36h11");
+
+        // Detect tags
+        List<AprilTagDetection> detections = detector.detect(gray);
+
+        // Process detections
+        for (AprilTagDetection detection : detections) {
+            int id = detection.getId();
+            double[] translation = detection.getCenter();
+            double[] rotation = detection.getRotation();
+
+            // Create transformation matrix
+            SimpleMatrix transform = SimpleMatrix.identity(4);
+            for (int row = 0; row < 3; row++) {
+                for (int col = 0; col < 3; col++) {
+                    transform.set(row, col, rotation[row * 3 + col]);
+                }
+                transform.set(row, 3, translation[row]);
+            }
+
+            detectedTags.add(new DetectedTag(id, transform));
+        }
+
+        return detectedTags;
+    }
+
+    public static void compareWithIdealMap(List<DetectedTag> detectedTags, Map<Integer, SimpleMatrix> idealTransforms) {
+        // Implement comparison logic
+        for (DetectedTag detectedTag : detectedTags) {
+            SimpleMatrix idealTransform = idealTransforms.get(detectedTag.id);
+            if (idealTransform != null) {
+                // Compare detectedTag.transform with idealTransform
+                // Add code to visualize or log the comparison results
+                System.out.println("Tag ID: " + detectedTag.id);
+                System.out.println("Detected Transform: " + detectedTag.transform);
+                System.out.println("Ideal Transform: " + idealTransform);
+                System.out.println("Difference: " + idealTransform.minus(detectedTag.transform));
+            }
         }
     }
 
-    public static class Pose {
-        public SimpleMatrix p;
-        public SimpleMatrix q;
+    public static class DetectedTag {
+        public int id;
+        public SimpleMatrix transform;
 
-        public Pose(SimpleMatrix p, SimpleMatrix q) {
-            this.p = p;
-            this.q = q;
-        }
-    }
-
-    public static class Constraint {
-        public int id_begin;
-        public int id_end;
-
-        public Constraint(int id_begin, int id_end) {
-            this.id_begin = id_begin;
-            this.id_end = id_end;
+        public DetectedTag(int id, SimpleMatrix transform) {
+            this.id = id;
+            this.transform = transform;
         }
     }
 }
